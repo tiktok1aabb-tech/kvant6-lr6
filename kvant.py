@@ -174,8 +174,25 @@ def decode(code: bytes, pc: int):
     decode(bytes([0x01, 0, 0, 0, 42]), 0)  ->  ('PUSH', [42], 5)
     decode(bytes([0x2B, 0, 8, 1]), 0)      ->  ('CALL', [8, 1], 4)
     """
-    # TODO 2.1  Не забудьте: i32 — со знаком (int.from_bytes(..., 'big', signed=True)).
-    raise NotImplementedError('Глава 2: decode')
+    if pc < 0 or pc >= len(code):
+        return None
+
+    opcode = code[pc]
+    if opcode not in OPCODES:
+        return None
+
+    name, form = OPCODES[opcode]
+    args = []
+    pos = pc + 1
+    for letter in form:
+        size = OPERAND_SIZE[letter]
+        if pos + size > len(code):
+            raise VMError(f'pc={pc:04X}: обрезанная команда {name}')
+        number = int.from_bytes(code[pos:pos + size], 'big', signed=(letter == 'i'))
+        args.append(number)
+        pos += size
+
+    return name, args, pos
 
 
 def disassemble(cart: Cartridge) -> str:
@@ -189,8 +206,52 @@ def disassemble(cart: Cartridge) -> str:
     Метки L_XXXX — у адресов, на которые ведут переходы/вызовы, и у точки входа.
     Неизвестный байт печатается как  ??      0x40  и разбор идёт дальше со следующего байта.
     """
-    # TODO 2.2  Сделайте два прохода: сначала соберите адреса меток, потом печатайте.
-    raise NotImplementedError('Глава 2: disassemble')
+    # Первый проход: разбираем команды и собираем адреса с метками.
+    commands = []
+    labels = {cart.entry}
+    pc = 0
+    while pc < len(cart.code):
+        command = decode(cart.code, pc)
+        if command is None:
+            commands.append((pc, '??', [cart.code[pc]]))
+            pc += 1
+            continue
+
+        name, args, next_pc = command
+        form = OPCODES[cart.code[pc]][1]
+        for i in range(len(form)):
+            if form[i] == 'a':
+                labels.add(args[i])
+        commands.append((pc, name, args))
+        pc = next_pc
+
+    # Второй проход: оформляем листинг с адресами и метками.
+    lines = []
+    for pc, name, args in commands:
+        if pc in labels:
+            label = f'L_{pc:04X}:'
+            if pc == cart.entry:
+                label += '    ; точка входа'
+            lines.append(label)
+
+        if name == '??':
+            lines.append(f'  {pc:04X}  ??      0x{args[0]:02X}')
+            continue
+
+        form = OPCODES[cart.code[pc]][1]
+        values = []
+        for i in range(len(args)):
+            if form[i] == 'a':
+                values.append(f'L_{args[i]:04X}')
+            else:
+                values.append(str(args[i]))
+
+        line = f'  {pc:04X}  {name:<8}{", ".join(values)}'.rstrip()
+        if name == 'PRINTS' and 0 <= args[0] < len(cart.consts):
+            line += f'    ; {cart.consts[args[0]]!r}'
+        lines.append(line)
+
+    return '\n'.join(lines)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -560,6 +621,7 @@ def cmd_info(path):
 def cmd_dis(path, out=None):
     text = disassemble(read_cartridge(path))
     if out:
+        os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
         with open(out, 'w', encoding='utf-8') as f:
             f.write(text)
         print(f'Листинг записан в {out}')
