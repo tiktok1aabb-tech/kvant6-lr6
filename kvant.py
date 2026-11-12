@@ -271,8 +271,7 @@ class VM:
                 b, a = self.pop(), self.pop()
                 self.push(int(a == b if isinstance(a, int) and isinstance(b, int) else a is b))
             elif name in ('LOAD', 'STORE', 'GLOAD', 'GSTORE'):
-                i = args[
-                    0]
+                i = args[0]
                 cells = self.globals if name.startswith('G') else self.frames[-1].locals
                 if i >= len(cells): raise VMError('нет такой глобальной переменной' if name.startswith('G') else 'нет такой локальной переменной')
                 if name.endswith('LOAD'): self.push(cells[i])
