@@ -81,23 +81,23 @@ class Reader:
 
     def take(self, n: int) -> bytes:
         """Вернуть следующие n байтов и сдвинуть курсор. Если байтов не хватает — LoadError."""
-        # TODO 1.1  Подсказка: срез  self.data[self.pos : self.pos + n]
-        raise NotImplementedError('Глава 1: Reader.take')
+        if n < 0 or self.pos + n > len(self.data):
+            raise LoadError('не хватает байтов в картридже')
+        part = self.data[self.pos:self.pos + n]
+        self.pos += n
+        return part
 
     def u8(self) -> int:
         """1 байт без знака (0…255)."""
-        # TODO 1.1
-        raise NotImplementedError('Глава 1: Reader.u8')
+        return self.take(1)[0]
 
     def u16(self) -> int:
         """2 байта без знака, big-endian."""
-        # TODO 1.1  Подсказка: int.from_bytes(..., 'big')
-        raise NotImplementedError('Глава 1: Reader.u16')
+        return int.from_bytes(self.take(2), 'big')
 
     def u32(self) -> int:
         """4 байта без знака, big-endian."""
-        # TODO 1.1
-        raise NotImplementedError('Глава 1: Reader.u32')
+        return int.from_bytes(self.take(4), 'big')
 
 
 def load(data: bytes) -> Cartridge:
@@ -106,9 +106,36 @@ def load(data: bytes) -> Cartridge:
     Проверить: длину, сигнатуру KVNT, SHA-256 (последние 32 байта файла).
     При любой проблеме — raise LoadError('понятное сообщение').
     """
-    # TODO 1.2  Порядок полей: сигнатура, версия, владелец, тип, куча,
-    #           глобальные, точка входа, пул строк, код, контрольная сумма.
-    raise NotImplementedError('Глава 1: load')
+    if len(data) < 36:
+        raise LoadError('слишком короткий файл')
+    if data[:4] != MAGIC:
+        raise LoadError('неверная сигнатура KVNT')
+    body, digest = data[:-32], data[-32:]
+    if hashlib.sha256(body).digest() != digest:
+        raise LoadError('контрольная сумма SHA-256 не совпадает')
+    r = Reader(body)
+    try:
+        r.take(4)
+        version = (r.u8(), r.u8())
+        if version != (1, 0):
+            raise LoadError('неподдерживаемая версия формата')
+        owner = r.take(r.u8()).decode('utf-8')
+        kind = r.u8()
+        heap = r.u16()
+        nglobals = r.u8()
+        entry = r.u16()
+        count = r.u16()
+        consts = []
+        for _ in range(count):
+            consts.append(r.take(r.u16()).decode('utf-8'))
+        code = r.take(r.u32())
+        if r.pos != len(body):
+            raise LoadError('неверная длина секций картриджа')
+        if entry >= len(code):
+            raise LoadError('точка входа за пределами кода')
+    except (UnicodeDecodeError, ValueError) as e:
+        raise LoadError(f'повреждённый формат: {e}') from e
+    return Cartridge(owner, kind, heap, nglobals, entry, consts, code, version)
 
 
 # ════════════════════════════════════════════════════════════════════════
