@@ -179,7 +179,6 @@ class Frame:
         self.ret, self.base = ret, base
         self.locals = [0] * 16
 # ГЛАВЫ 3 И 4. Выполнение команд картриджа.
-
 class VM:
     def __init__(self, cart, hidden=None, heap_capacity=None,
                  no_limit=False, echo=False, trace=False):
@@ -188,7 +187,7 @@ class VM:
         self.globals = [0] * cart.nglobals
         self.heap = Heap(cart.heap if heap_capacity is None else heap_capacity, no_limit)
         self.screen = [[0] * 32 for i in range(32)]
-        self.out, self.decoded = [], {}  # глава 7: запоминаем готовые команды
+        self.out, self.decoded = [], {}  # Глава 7: кэш декодированных команд
         self.steps, self.halted = 0, False
         self.echo, self.trace = echo, trace
         self.hidden = HIDDEN if hidden is None else hidden
@@ -230,14 +229,15 @@ class VM:
                 f'объектов создано:     {h.allocated}\n'
                 f'объектов освобождено: {h.freed}\n')
     def run(self, max_steps=200_000_000):
+        step = self.step  # Глава 7: не искать метод заново на каждом шаге
         while not self.halted:
             if self.steps >= max_steps: raise VMError('слишком много шагов — похоже на бесконечный цикл')
             if self.trace: print(self.trace_line(), file=sys.stderr)
-            self.step()
+            step()
     def step(self):
         pc = self.pc
-        if pc not in self.decoded: self.decoded[pc] = decode(self.code, pc)
-        d = self.decoded[pc]
+        d = self.decoded.get(pc)
+        if d is None: d = self.decoded[pc] = decode(self.code, pc)
         if d is None:
             byte = self.code[pc] if 0 <= pc < len(self.code) else 255
             raise VMError(f'pc={pc:04X}: неизвестная команда 0x{byte:02X}')
