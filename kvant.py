@@ -1,456 +1,226 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-КВАНТ-6 — эмулятор учебной ЭВМ.  Лабораторная работа № 6.
-
-Это ваш рабочий файл. Он уже запускается, но почти ничего не умеет:
-в местах, помеченных  TODO, машину предстоит достроить вам.
-Порядок работы — по главам задачника (lab6_student.html):
-
-    глава 1  — Reader, load()                  -> python kvant.py info DEMO.kv6
-    глава 2  — decode(), disassemble()         -> python kvant.py dis  DEMO.kv6
-    глава 3  — wrap32, деление, стек, step()   -> python kvant.py run  DEMO.kv6 --no-limit
-    глава 4  — CALL/RET, куча без сборки, PIX  -> экран вашего картриджа
-    глава 5  — скрытые команды X1–X3           -> КОД-1
-    глава 6  — сборщик мусора                  -> КОД-2 и послание
-    глава 7  — (бонус) ускорение               -> python kvant.py bench BENCH.kv6
-
-Проверка себя:   python test_kvant.py        (или  python test_kvant.py 3  — только глава 3)
-
-Всё, что НЕ помечено TODO, — готовые инструменты: командная строка,
-сохранение PNG, печать статистики. Их можно не трогать (но читать полезно).
-"""
-
+# ЛР №6. Виртуальная машина «Квант-6». Главы 1–7.
 import hashlib
+import math
 import os
 import sys
 import time
-from dataclasses import dataclass, field
-
-# Чтобы русские буквы нормально печатались в консоли Windows.
-try:
-    sys.stdout.reconfigure(encoding='utf-8')
-    sys.stderr.reconfigure(encoding='utf-8')
-except Exception:
+class LoadError(Exception):
     pass
 
-
-# ════════════════════════════════════════════════════════════════════════
-#  Ошибки
-# ════════════════════════════════════════════════════════════════════════
-
-class LoadError(Exception):
-    """Файл не является исправным картриджем."""
-
-
 class VMError(Exception):
-    """Машина остановилась с ошибкой (деление на ноль, пустой стек и т. п.)."""
+    pass
 
-
-# ════════════════════════════════════════════════════════════════════════
-#  ГЛАВА 1.  Загрузчик
-# ════════════════════════════════════════════════════════════════════════
-
-MAGIC = b'KVNT'
-
-
-@dataclass
+# ГЛАВА 1. Загрузчик — читаем картридж и проверяем SHA-256.
 class Cartridge:
-    """Всё, что загрузчик достал из файла."""
-    owner: str                  # номер студенческого владельца
-    kind: int                   # 0 — основной, 1 — бенчмарк, 2 — экзаменационный
-    heap: int                   # ёмкость кучи в слотах
-    nglobals: int               # сколько глобальных переменных G[...]
-    entry: int                  # точка входа — адрес первой команды
-    consts: list = field(default_factory=list)   # пул строк
-    code: bytes = b''           # секция кода
-    version: tuple = (1, 0)
-
-
+    def __init__(self, owner, kind, heap, nglobals, entry,
+                 consts=None, code=b'', version=(1, 0)):
+        self.owner, self.kind = owner, kind
+        self.heap, self.nglobals, self.entry = heap, nglobals, entry
+        self.consts = [] if consts is None else consts
+        self.code, self.version = code, version
 class Reader:
-    """Читает байты по порядку, как курсор в тексте.
-
-    r = Reader(b'\\x00\\x2A\\xFF')
-    r.u16()  -> 42      (два байта, старший вперёд)
-    r.u8()   -> 255
-    """
-
-    def __init__(self, data: bytes):
-        self.data = data
-        self.pos = 0            # где сейчас курсор
-
-    def take(self, n: int) -> bytes:
-        """Вернуть следующие n байтов и сдвинуть курсор. Если байтов не хватает — LoadError."""
+    def __init__(self, data): self.data, self.pos = data, 0
+    def take(self, n):
         if n < 0 or self.pos + n > len(self.data):
             raise LoadError('не хватает байтов в картридже')
         part = self.data[self.pos:self.pos + n]
         self.pos += n
         return part
-
-    def u8(self) -> int:
-        """1 байт без знака (0…255)."""
-        return self.take(1)[0]
-
-    def u16(self) -> int:
-        """2 байта без знака, big-endian."""
-        return int.from_bytes(self.take(2), 'big')
-
-    def u32(self) -> int:
-        """4 байта без знака, big-endian."""
-        return int.from_bytes(self.take(4), 'big')
-
-
-def load(data: bytes) -> Cartridge:
-    """Разобрать картридж (формат — в главе 1 задачника).
-
-    Проверить: длину, сигнатуру KVNT, SHA-256 (последние 32 байта файла).
-    При любой проблеме — raise LoadError('понятное сообщение').
-    """
-    if len(data) < 36:
-        raise LoadError('слишком короткий файл')
-    if data[:4] != MAGIC:
-        raise LoadError('неверная сигнатура KVNT')
-    body, digest = data[:-32], data[-32:]
-    if hashlib.sha256(body).digest() != digest:
+    def u8(self): return self.take(1)[0]
+    def u16(self): return int.from_bytes(self.take(2), 'big')
+    def u32(self): return int.from_bytes(self.take(4), 'big')
+def load(data):
+    if len(data) < 36: raise LoadError('слишком короткий файл')
+    if data[:4] != b'KVNT': raise LoadError('неверная сигнатура KVNT')
+    body, check = data[:-32], data[-32:]
+    if hashlib.sha256(body).digest() != check:
         raise LoadError('контрольная сумма SHA-256 не совпадает')
     r = Reader(body)
     try:
         r.take(4)
         version = (r.u8(), r.u8())
-        if version != (1, 0):
-            raise LoadError('неподдерживаемая версия формата')
+        if version != (1, 0): raise LoadError('неподдерживаемая версия формата')
         owner = r.take(r.u8()).decode('utf-8')
-        kind = r.u8()
-        heap = r.u16()
-        nglobals = r.u8()
-        entry = r.u16()
-        count = r.u16()
-        consts = []
-        for _ in range(count):
-            consts.append(r.take(r.u16()).decode('utf-8'))
+        kind, heap, count_globals = r.u8(), r.u16(), r.u8()
+        entry, count = r.u16(), r.u16()
+        strings = []
+        for i in range(count): strings.append(r.take(r.u16()).decode('utf-8'))
         code = r.take(r.u32())
-        if r.pos != len(body):
-            raise LoadError('неверная длина секций картриджа')
-        if entry >= len(code):
-            raise LoadError('точка входа за пределами кода')
-    except (UnicodeDecodeError, ValueError) as e:
-        raise LoadError(f'повреждённый формат: {e}') from e
-    return Cartridge(owner, kind, heap, nglobals, entry, consts, code, version)
+        if r.pos != len(body): raise LoadError('неверная длина секций картриджа')
+        if entry >= len(code): raise LoadError('точка входа за пределами кода')
+    except (UnicodeDecodeError, ValueError) as error:
+        raise LoadError('повреждённый формат: ' + str(error))
+    return Cartridge(owner, kind, heap, count_globals, entry, strings, code, version)
 
-
-# ════════════════════════════════════════════════════════════════════════
-#  ГЛАВА 2.  Команды и дизассемблер
-# ════════════════════════════════════════════════════════════════════════
-
-# Код операции -> (мнемоника, форма операндов).
-# Буквы формы:  i — i32 (4 байта со знаком)   b — u8 (1 байт)
-#               w — u16 (номер строки/теста)  a — u16 адрес перехода
-# Например, CALL имеет форму 'ab': сначала адрес (2 байта), потом n (1 байт).
+# ГЛАВА 2. Таблица команд и дизассемблер.
 OPCODES = {
-    0x00: ('NOP', ''),     0x01: ('PUSH', 'i'),  0x02: ('POP', ''),
-    0x03: ('DUP', ''),     0x04: ('SWAP', ''),
-    0x10: ('ADD', ''),     0x11: ('SUB', ''),    0x12: ('MUL', ''),
-    0x13: ('DIV', ''),     0x14: ('MOD', ''),    0x15: ('NEG', ''),
-    0x18: ('EQ', ''),      0x19: ('LT', ''),     0x1A: ('GT', ''),   0x1B: ('NOT', ''),
-    0x20: ('LOAD', 'b'),   0x21: ('STORE', 'b'), 0x22: ('GLOAD', 'b'), 0x23: ('GSTORE', 'b'),
-    0x28: ('JMP', 'a'),    0x29: ('JZ', 'a'),    0x2A: ('JNZ', 'a'),
-    0x2B: ('CALL', 'ab'),  0x2C: ('RET', ''),    0x2D: ('HALT', ''),
-    0x30: ('NEW', ''),     0x31: ('GETF', ''),   0x32: ('SETF', ''),
-    0x33: ('LEN', ''),     0x34: ('MEMINFO', 'b'),
-    0x38: ('PRINT', ''),   0x39: ('PRINTC', ''), 0x3A: ('PRINTS', 'w'),
-    0x3B: ('PIX', ''),     0x3C: ('ASSERT', 'w'),
-    0x40: ('X1', ''),      0x41: ('X2', ''),     0x42: ('X3', ''),
+    0x00: ('NOP', ''), 0x01: ('PUSH', 'i'), 0x02: ('POP', ''),
+    0x03: ('DUP', ''), 0x04: ('SWAP', ''),
+    0x10: ('ADD', ''), 0x11: ('SUB', ''), 0x12: ('MUL', ''),
+    0x13: ('DIV', ''), 0x14: ('MOD', ''), 0x15: ('NEG', ''),
+    0x18: ('EQ', ''), 0x19: ('LT', ''), 0x1A: ('GT', ''), 0x1B: ('NOT', ''),
+    0x20: ('LOAD', 'b'), 0x21: ('STORE', 'b'),
+    0x22: ('GLOAD', 'b'), 0x23: ('GSTORE', 'b'),
+    0x28: ('JMP', 'a'), 0x29: ('JZ', 'a'), 0x2A: ('JNZ', 'a'),
+    0x2B: ('CALL', 'ab'), 0x2C: ('RET', ''), 0x2D: ('HALT', ''),
+    0x30: ('NEW', ''), 0x31: ('GETF', ''), 0x32: ('SETF', ''),
+    0x33: ('LEN', ''), 0x34: ('MEMINFO', 'b'),
+    0x38: ('PRINT', ''), 0x39: ('PRINTC', ''), 0x3A: ('PRINTS', 'w'),
+    0x3B: ('PIX', ''), 0x3C: ('ASSERT', 'w'),
+    0x40: ('X1', ''), 0x41: ('X2', ''), 0x42: ('X3', '')
 }
-
-OPERAND_SIZE = {'i': 4, 'b': 1, 'w': 2, 'a': 2}
-
-
-def decode(code: bytes, pc: int):
-    """Расшифровать одну команду по адресу pc.
-
-    Вернуть кортеж (мнемоника, [операнды], адрес_следующей_команды)
-    или None, если такого кода операции нет в OPCODES.
-
-    decode(bytes([0x01, 0, 0, 0, 42]), 0)  ->  ('PUSH', [42], 5)
-    decode(bytes([0x2B, 0, 8, 1]), 0)      ->  ('CALL', [8, 1], 4)
-    """
-    if pc < 0 or pc >= len(code):
-        return None
-
-    opcode = code[pc]
-    if opcode not in OPCODES:
-        return None
-
-    name, form = OPCODES[opcode]
-    args = []
-    pos = pc + 1
+def decode(code, pc):
+    if pc < 0 or pc >= len(code) or code[pc] not in OPCODES: return None
+    name, form = OPCODES[code[pc]]
+    args, pos = [], pc + 1
     for letter in form:
-        size = OPERAND_SIZE[letter]
+        size = 4 if letter == 'i' else 1 if letter == 'b' else 2
         if pos + size > len(code):
             raise VMError(f'pc={pc:04X}: обрезанная команда {name}')
-        number = int.from_bytes(code[pos:pos + size], 'big', signed=(letter == 'i'))
-        args.append(number)
+        args.append(int.from_bytes(code[pos:pos + size], 'big', signed=letter == 'i'))
         pos += size
-
     return name, args, pos
-
-
-def disassemble(cart: Cartridge) -> str:
-    """Листинг всего кода в формате главы 2.
-
-    L_0008:
-      0008  LOAD    0
-      0010  JZ      L_0019
-      006C  PRINTS  0    ; 'ПРИВЕТ, КВАНТ-6!\\n'
-
-    Метки L_XXXX — у адресов, на которые ведут переходы/вызовы, и у точки входа.
-    Неизвестный байт печатается как  ??      0x40  и разбор идёт дальше со следующего байта.
-    """
-    # Первый проход: разбираем команды и собираем адреса с метками.
-    commands = []
-    labels = {cart.entry}
+def disassemble(cart):
+    commands, labels = [], {cart.entry}
     pc = 0
     while pc < len(cart.code):
-        command = decode(cart.code, pc)
-        if command is None:
+        d = decode(cart.code, pc)
+        if d is None:
             commands.append((pc, '??', [cart.code[pc]]))
             pc += 1
             continue
-
-        name, args, next_pc = command
+        name, args, end = d
         form = OPCODES[cart.code[pc]][1]
         for i in range(len(form)):
-            if form[i] == 'a':
-                labels.add(args[i])
+            if form[i] == 'a': labels.add(args[i])
         commands.append((pc, name, args))
-        pc = next_pc
-
-    # Второй проход: оформляем листинг с адресами и метками.
+        pc = end
     lines = []
     for pc, name, args in commands:
         if pc in labels:
             label = f'L_{pc:04X}:'
-            if pc == cart.entry:
-                label += '    ; точка входа'
+            if pc == cart.entry: label += '    ; точка входа'
             lines.append(label)
-
         if name == '??':
             lines.append(f'  {pc:04X}  ??      0x{args[0]:02X}')
             continue
-
         form = OPCODES[cart.code[pc]][1]
         values = []
-        for i in range(len(args)):
-            if form[i] == 'a':
-                values.append(f'L_{args[i]:04X}')
-            else:
-                values.append(str(args[i]))
-
+        for i in range(len(args)): values.append(f'L_{args[i]:04X}' if form[i] == 'a' else str(args[i]))
         line = f'  {pc:04X}  {name:<8}{", ".join(values)}'.rstrip()
-        if name == 'PRINTS' and 0 <= args[0] < len(cart.consts):
-            line += f'    ; {cart.consts[args[0]]!r}'
+        if name == 'PRINTS' and 0 <= args[0] < len(cart.consts): line += f'    ; {cart.consts[args[0]]!r}'
         lines.append(line)
-
     return '\n'.join(lines)
 
+# ГЛАВА 3. Целые 32-битные числа, стек и арифметика.
+def wrap32(x):
+    x = x & 0xFFFFFFFF
+    return x - 4294967296 if x >= 2147483648 else x
+def java_div(a, b):
+    if b == 0:
+        raise VMError('деление на ноль')
+    result = abs(a) // abs(b)
+    return wrap32(-result if (a < 0) != (b < 0) else result)
+def java_mod(a, b): return wrap32(a - b * java_div(a, b))
 
-# ════════════════════════════════════════════════════════════════════════
-#  ГЛАВА 3.  32-битная арифметика «как в Java»
-# ════════════════════════════════════════════════════════════════════════
-
-def wrap32(x: int) -> int:
-    """Привести целое Python к 32-битному со знаком (отбросить старшие биты).
-
-    wrap32(2**31) -> -2147483648      wrap32(65536 * 65536) -> 0
-    """
-    # TODO 3.1  Подсказка: x & 0xFFFFFFFF, а потом разберитесь со знаком.
-    raise NotImplementedError('Глава 3: wrap32')
-
-
-def java_div(a: int, b: int) -> int:
-    """Частное, округлённое К НУЛЮ:  java_div(-7, 2) -> -3   (а -7 // 2 в Python = -4!)."""
-    # TODO 3.2  b == 0 -> raise VMError('деление на ноль')
-    raise NotImplementedError('Глава 3: java_div')
-
-
-def java_mod(a: int, b: int) -> int:
-    """Остаток со знаком делимого:  a - b * java_div(a, b).   java_mod(-7, 2) -> -1."""
-    # TODO 3.2
-    raise NotImplementedError('Глава 3: java_mod')
-
-
-# ════════════════════════════════════════════════════════════════════════
-#  ГЛАВА 5.  Скрытые команды
-# ════════════════════════════════════════════════════════════════════════
-# Каждая скрытая команда — функция f(a, b) -> int, результат в 32 битах.
-# Когда разгадаете команду, допишите её сюда, например:
-#
-#     def x1(a, b):
-#         return wrap32(...)
-#
-#     HIDDEN = {'X1': x1}
-#
-# Пока команды нет в словаре, машина честно останавливается на ней
-# с ошибкой «неизвестная команда 0x40».
-
-HIDDEN = {}
-
-
-# ════════════════════════════════════════════════════════════════════════
-#  ГЛАВЫ 4 и 6.  Куча и сборщик мусора
-# ════════════════════════════════════════════════════════════════════════
-
+# ГЛАВА 5. Три скрытые команды индивидуального картриджа.
+def x1(a, b): return wrap32(abs(a - b))
+def x2(a, b): return wrap32(max(a, b))
+def x3(a, b): return wrap32(math.gcd(a, b))
+HIDDEN = {'X1': x1, 'X2': x2, 'X3': x3}
+# ГЛАВЫ 4 И 6. Объекты в куче и сборщик мусора.
 class HeapObject:
-    """Массив в куче «Кванта». Ссылка на него — это сам объект Python."""
-    __slots__ = ('items', 'alive', 'marked')
-
-    def __init__(self, n: int, fill=0):
-        self.items = [fill] * n     # элементы: числа или ссылки (HeapObject)
-        self.alive = True           # False — объект освобождён сборщиком
-        self.marked = False         # пометка для сборщика (глава 6)
-
-    def __repr__(self):
-        return f'<объект[{len(self.items)}]{"" if self.alive else " освобождён"}>'
-
-
+    def __init__(self, n, fill=0):
+        self.items = [fill] * n
+        self.alive, self.marked = True, False
+    def __repr__(self): return f'<объект[{len(self.items)}]{"" if self.alive else " освобождён"}>'
 class Heap:
-    """Учёт памяти. Объект из n элементов занимает n + 1 слот."""
-
-    def __init__(self, capacity: int, no_limit: bool = False):
-        self.capacity = capacity
-        self.no_limit = no_limit     # True — ёмкость игнорируется, сборки нет
-        self.objects = []            # все созданные и ещё не освобождённые объекты
-        self.used = 0                # занято слотов
-        self.peak = 0                # максимум used за всё время
-        self.gc_count = 0            # сколько раз запускалась сборка
-        self.allocated = 0           # сколько объектов создано всего
-        self.freed = 0               # сколько объектов освобождено всего
-        self.log = []                # история для графика: (номер_команды, used, событие)
-
-    def alloc(self, n: int, vm, fill=0) -> HeapObject:
-        """Создать объект из n элементов (правила — глава 4, затем глава 6).
-
-        vm передаётся, чтобы сборщик мог спросить у машины корни (vm.roots())
-        и номер текущей команды (vm.steps) для графика.
-        """
-        # TODO 4.3  Проверить n (число, 1…4096), создать HeapObject, обновить
-        #           used / peak / allocated, добавить в self.objects,
-        #           записать в self.log (vm.steps, self.used, 'alloc').
-        # TODO 6.3  Перед созданием: если не no_limit и used + (n+1) > capacity —
-        #           self.collect(vm); если места всё равно нет — VMError('OUT OF MEMORY').
-        raise NotImplementedError('Глава 4: Heap.alloc')
-
+    def __init__(self, capacity, no_limit=False):
+        self.capacity, self.no_limit = capacity, no_limit
+        self.objects, self.log = [], []
+        self.used = self.peak = self.gc_count = 0
+        self.allocated = self.freed = 0
+    def alloc(self, n, vm, fill=0):
+        if not isinstance(n, int) or not 1 <= n <= 4096: raise VMError('недопустимый размер массива NEW')
+        cost = n + 1  # элементам нужен ещё один слот служебной информации
+        if not self.no_limit and self.used + cost > self.capacity:
+            self.collect(vm)
+            if self.used + cost > self.capacity: raise VMError('OUT OF MEMORY')
+        obj = HeapObject(n, fill)
+        self.objects.append(obj)
+        self.used += cost
+        self.allocated += 1
+        self.peak = max(self.peak, self.used)
+        self.log.append((vm.steps, self.used, 'alloc'))
+        return obj
     def collect(self, vm):
-        """Сборка мусора «пометка и очистка» (mark & sweep). Глава 6."""
-        # TODO 6.2  1) gc_count += 1, запись в log (vm.steps, used, 'gc_before')
-        #           2) пометка: обойти всё достижимое из vm.roots()
-        #              (без рекурсии Python — используйте список-«очередь дел»)
-        #           3) очистка: непомеченные -> alive = False, вернуть их слоты,
-        #              помеченным снять пометку
-        #           4) запись в log (vm.steps, used, 'gc_after')
-        raise NotImplementedError('Глава 6: Heap.collect')
-
-
-# ════════════════════════════════════════════════════════════════════════
-#  ГЛАВЫ 3–6.  Машина
-# ════════════════════════════════════════════════════════════════════════
-
-STACK_LIMIT = 1024
-FRAME_LIMIT = 256
-NLOCALS = 16
-
-
+        self.gc_count += 1
+        self.log.append((vm.steps, self.used, 'gc_before'))
+        todo = [v for v in vm.roots() if isinstance(v, HeapObject) and v.alive]
+        while todo:
+            obj = todo.pop()
+            if obj.marked: continue
+            obj.marked = True
+            for v in obj.items:
+                if isinstance(v, HeapObject) and v.alive and not v.marked: todo.append(v)
+        live = []
+        for obj in self.objects:
+            if obj.marked:
+                obj.marked = False
+                live.append(obj)
+            else:
+                obj.alive = False
+                self.used -= len(obj.items) + 1
+                self.freed += 1
+        self.objects = live
+        self.log.append((vm.steps, self.used, 'gc_after'))
 class Frame:
-    """Кадр вызова функции."""
-    __slots__ = ('locals', 'ret', 'base')
-
-    def __init__(self, ret: int, base: int):
-        self.locals = [0] * NLOCALS   # L[0] … L[15]
-        self.ret = ret                # адрес возврата
-        self.base = base              # «дно»: высота стека в момент входа
-
+    def __init__(self, ret, base):
+        self.ret, self.base = ret, base
+        self.locals = [0] * 16
+# ГЛАВЫ 3 И 4. Выполнение команд картриджа.
 
 class VM:
-    def __init__(self, cart: Cartridge, hidden=None, heap_capacity=None,
+    def __init__(self, cart, hidden=None, heap_capacity=None,
                  no_limit=False, echo=False, trace=False):
-        self.cart = cart
-        self.code = cart.code
-        self.pc = cart.entry
-        self.stack = []                           # стек операндов
-        self.frames = [Frame(ret=-1, base=0)]     # кадр главной программы
+        self.cart, self.code, self.pc = cart, cart.code, cart.entry
+        self.stack, self.frames = [], [Frame(-1, 0)]
         self.globals = [0] * cart.nglobals
-        cap = cart.heap if heap_capacity is None else heap_capacity
-        self.heap = Heap(cap, no_limit)
-        self.screen = [[0] * 32 for _ in range(32)]   # screen[y][x]
-        self.out = []                             # всё, что напечатала программа
-        self.steps = 0
-        self.halted = False
-        self.echo = echo                          # печатать вывод сразу
-        self.trace = trace                        # печатать каждую команду (отладка)
+        self.heap = Heap(cart.heap if heap_capacity is None else heap_capacity, no_limit)
+        self.screen = [[0] * 32 for i in range(32)]
+        self.out, self.decoded = [], {}  # глава 7: запоминаем готовые команды
+        self.steps, self.halted = 0, False
+        self.echo, self.trace = echo, trace
         self.hidden = HIDDEN if hidden is None else hidden
-        self.handlers = self._build_handlers()
-
-    # ── готовые инструменты ─────────────────────────────────────────────
-    def _build_handlers(self):
-        """Таблица диспетчеризации: мнемоника -> метод op_<мнемоника>.
-
-        Метод op_push обрабатывает PUSH, op_add — ADD и т. д. Если метода нет,
-        команда считается неизвестной. Скрытые команды берутся из self.hidden.
-        """
-        table = {}
-        for name, _form in OPCODES.values():
-            method = getattr(self, 'op_' + name.lower(), None)
-            if name in ('X1', 'X2', 'X3'):
-                if name in self.hidden:
-                    table[name] = self._make_hidden(self.hidden[name])
-            elif method is not None:
-                table[name] = method
-            else:
-                table[name] = self._not_yet(name)
-        return table
-
-    @staticmethod
-    def _not_yet(name):
-        def handler(args):
-            raise NotImplementedError(f'команда {name} — нет метода op_{name.lower()}')
-        return handler
-
-    def _make_hidden(self, f):
-        def handler(args):
-            b = self.pop_int()
-            a = self.pop_int()
-            self.push(wrap32(f(a, b)))
-        return handler
-
-    def write(self, text: str):
-        """Вывод программы (PRINT, PRINTC, PRINTS)."""
+    def push(self, value):
+        if len(self.stack) >= 1024: raise VMError('переполнение стека')
+        self.stack.append(value)
+    def pop(self):
+        if len(self.stack) <= self.frames[-1].base: raise VMError('стек пуст')
+        return self.stack.pop()
+    def pop_int(self):
+        value = self.pop()
+        if not isinstance(value, int): raise VMError('ожидалось число')
+        return value
+    def pop_ref(self):
+        value = self.pop()
+        if not isinstance(value, HeapObject): raise VMError('ожидалась ссылка')
+        if not value.alive: raise VMError('обращение к освобождённому объекту')
+        return value
+    def roots(self):
+        values = self.stack + self.globals
+        for frame in self.frames: values += frame.locals
+        return values
+    def write(self, text):
         self.out.append(text)
-        if self.echo:
-            print(text, end='', flush=True)
-
-    def output(self) -> str:
-        return ''.join(self.out)
-
-    @property
-    def frame(self) -> Frame:
-        """Текущий кадр."""
-        return self.frames[-1]
-
-    def run(self, max_steps=200_000_000):
-        while not self.halted:
-            if self.steps >= max_steps:
-                raise VMError('слишком много шагов — похоже на бесконечный цикл')
-            if self.trace:
-                print(self.trace_line(), file=sys.stderr)
-            self.step()
-
-    def trace_line(self) -> str:
+        if self.echo: print(text, end='', flush=True)
+    def output(self): return ''.join(self.out)
+    def trace_line(self):
         d = decode(self.code, self.pc)
-        what = '??' if d is None else (d[0] + ' ' + ', '.join(map(str, d[1]))).strip()
-        top = ', '.join(_short(v) for v in self.stack[-6:])
-        return f'{self.steps:>8}  {self.pc:04X}  {what:<18} стек: [{"…, " if len(self.stack) > 6 else ""}{top}]'
-
-    def stats(self) -> str:
+        name = '??' if d is None else (d[0] + ' ' + ', '.join(map(str, d[1]))).strip()
+        values = ', '.join(str(v) for v in self.stack[-6:])
+        return f'{self.steps:>8}  {self.pc:04X}  {name:<18} стек: [{values}]'
+    def stats(self):
         h = self.heap
         return ('=== СТАТИСТИКА ===\n'
                 f'команд выполнено:     {self.steps}\n'
@@ -459,266 +229,244 @@ class VM:
                 f'занято в конце:       {h.used}\n'
                 f'объектов создано:     {h.allocated}\n'
                 f'объектов освобождено: {h.freed}\n')
-
-    # ── ГЛАВА 3: стек ───────────────────────────────────────────────────
-    def push(self, v):
-        """Положить значение на стек. Больше STACK_LIMIT — VMError('переполнение стека')."""
-        # TODO 3.3
-        raise NotImplementedError('Глава 3: VM.push')
-
-    def pop(self):
-        """Снять значение. Если стек не выше дна текущего кадра — VMError('стек пуст')."""
-        # TODO 3.3  Дно — self.frame.base
-        raise NotImplementedError('Глава 3: VM.pop')
-
-    def pop_int(self) -> int:
-        """Снять ЧИСЛО. Если там ссылка — VMError('ожидалось число')."""
-        # TODO 3.3
-        raise NotImplementedError('Глава 3: VM.pop_int')
-
-    def pop_ref(self) -> HeapObject:
-        """Снять ССЫЛКУ на живой объект. Число — 'ожидалась ссылка';
-        освобождённый объект — 'обращение к освобождённому объекту'."""
-        # TODO 4.3
-        raise NotImplementedError('Глава 4: VM.pop_ref')
-
-    # ── ГЛАВА 3: главный цикл ───────────────────────────────────────────
+    def run(self, max_steps=200_000_000):
+        while not self.halted:
+            if self.steps >= max_steps: raise VMError('слишком много шагов — похоже на бесконечный цикл')
+            if self.trace: print(self.trace_line(), file=sys.stderr)
+            self.step()
     def step(self):
-        """Выполнить одну команду: выборка -> расшифровка -> исполнение.
+        pc = self.pc
+        if pc not in self.decoded: self.decoded[pc] = decode(self.code, pc)
+        d = self.decoded[pc]
+        if d is None:
+            byte = self.code[pc] if 0 <= pc < len(self.code) else 255
+            raise VMError(f'pc={pc:04X}: неизвестная команда 0x{byte:02X}')
+        name, args, self.pc = d
+        self.steps += 1
+        try:
+            if name == 'NOP': pass
+            elif name == 'PUSH': self.push(args[0])
+            elif name == 'POP': self.pop()
+            elif name == 'DUP':
+                v = self.pop()
+                self.push(v)
+                self.push(v)
+            elif name == 'SWAP':
+                b, a = self.pop(), self.pop()
+                self.push(b)
+                self.push(a)
+            elif name in ('ADD', 'SUB', 'MUL', 'DIV', 'MOD', 'LT', 'GT'):
+                b, a = self.pop_int(), self.pop_int()
+                if name == 'ADD': v = wrap32(a + b)
+                elif name == 'SUB': v = wrap32(a - b)
+                elif name == 'MUL': v = wrap32(a * b)
+                elif name == 'DIV': v = java_div(a, b)
+                elif name == 'MOD': v = java_mod(a, b)
+                elif name == 'LT': v = int(a < b)
+                else: v = int(a > b)
+                self.push(v)
+            elif name == 'NEG': self.push(wrap32(-self.pop_int()))
+            elif name == 'NOT': self.push(int(self.pop_int() == 0))
+            elif name == 'EQ':
+                b, a = self.pop(), self.pop()
+                self.push(int(a == b if isinstance(a, int) and isinstance(b, int) else a is b))
+            elif name in ('LOAD', 'STORE', 'GLOAD', 'GSTORE'):
+                i = args[
+                    0]
+                cells = self.globals if name.startswith('G') else self.frames[-1].locals
+                if i >= len(cells): raise VMError('нет такой глобальной переменной' if name.startswith('G') else 'нет такой локальной переменной')
+                if name.endswith('LOAD'): self.push(cells[i])
+                else: cells[i] = self.pop()
+            elif name == 'JMP': self.pc = args[0]
+            elif name in ('JZ', 'JNZ'):
+                v = self.pop()
+                is_zero = isinstance(v, int) and v == 0
+                if (name == 'JZ' and is_zero) or (name == 'JNZ' and not is_zero): self.pc = args[0]
+            elif name == 'CALL':
+                address, count = args
+                if count > 16: raise VMError('слишком много аргументов для кадра')
+                if len(self.frames) >= 256: raise VMError('слишком глубокая рекурсия')
+                values = []
+                for i in range(count): values.insert(0, self.pop())
+                frame = Frame(self.pc, len(self.stack))
+                frame.locals[:count] = values
+                self.frames.append(frame)
+                self.pc = address
+            elif name == 'RET':
+                if len(self.frames) == 1: raise VMError('RET из главной программы')
+                result = self.pop()
+                frame = self.frames.pop()
+                del self.stack[frame.base:]
+                self.pc = frame.ret
+                self.push(result)
+            elif name == 'HALT': self.halted = True
+            elif name == 'NEW': self.push(self.heap.alloc(self.pop_int(), self))
+            elif name in ('GETF', 'SETF'):
+                value = self.pop() if name == 'SETF' else None
+                i = self.pop_int()
+                obj = self.pop_ref()
+                if not 0 <= i < len(obj.items): raise VMError('индекс вне границ массива')
+                if name == 'GETF': self.push(obj.items[i])
+                else: obj.items[i] = value
+            elif name == 'LEN': self.push(len(self.pop_ref().items))
+            elif name == 'MEMINFO':
+                h = self.heap
+                values = [h.gc_count, h.used, h.peak, h.capacity]
+                if args[0] >= len(values): raise VMError('неверный номер параметра MEMINFO')
+                self.push(values[args[0]])
+            elif name == 'PRINT': self.write(str(self.pop_int()))
+            elif name == 'PRINTC':
+                n = self.pop_int()
+                if not 0 <= n <= 0x10FFFF: raise VMError('неверный код символа')
+                self.write(chr(n))
+            elif name == 'PRINTS':
+                if args[0] >= len(self.cart.consts): raise VMError('нет такой строки')
+                self.write(self.cart.consts[args[0]])
+            elif name == 'ASSERT':
+                if self.pop_int() == 0: raise VMError(f'ASSERT {args[0]}: тест не пройден')
+            elif name == 'PIX':
+                color, y, x = self.pop_int(), self.pop_int(), self.pop_int()
+                if not (0 <= x < 32 and 0 <= y < 32 and 0 <= color < 8): raise VMError('PIX: координаты или цвет вне экрана')
+                self.screen[y][x] = color
+            elif name in ('X1', 'X2', 'X3'):
+                if name not in self.hidden: raise VMError('неизвестная команда')
+                b, a = self.pop_int(), self.pop_int()
+                self.push(wrap32(self.hidden[name](a, b)))
+            else: raise VMError('неизвестная команда')
+        except VMError as error:
+            raise VMError(f'pc={pc:04X} {name}: {error}') from error
 
-        1. Взять pc; расшифровать команду decode(self.code, pc).
-           Нет такой команды (None) или для неё нет обработчика в self.handlers —
-           VMError(f'pc={pc:04X}: неизвестная команда 0x{байт:02X}').
-        2. self.steps += 1;  self.pc = адрес следующей команды
-           (переходы потом сами перепишут self.pc).
-        3. Вызвать обработчик: self.handlers[мнемоника](операнды).
-        4. Если обработчик бросил VMError(msg), перебросить
-           VMError(f'pc={pc:04X} {мнемоника}: {msg}') — чтобы было видно, где упало.
-        """
-        # TODO 3.4
-        raise NotImplementedError('Глава 3: VM.step')
-
-    # ── обработчики команд ──────────────────────────────────────────────
-    # Каждый получает список операндов args (может быть пустым).
-    # Три уже написаны — по ним видно, как устроены остальные.
-
-    def op_nop(self, args):
-        pass
-
-    def op_push(self, args):
-        self.push(args[0])
-
-    def op_prints(self, args):
-        self.write(self.cart.consts[args[0]])
-
-    def op_halt(self, args):
-        self.halted = True
-
-    # TODO 3.5  Напишите остальные обработчики. Имена: op_pop, op_dup, op_swap,
-    #   op_add, op_sub, op_mul, op_div, op_mod, op_neg, op_eq, op_lt, op_gt, op_not,
-    #   op_load, op_store, op_gload, op_gstore, op_jmp, op_jz, op_jnz,
-    #   op_print, op_printc, op_assert                                  (глава 3)
-    #   op_call, op_ret, op_new, op_getf, op_setf, op_len, op_meminfo, op_pix (глава 4)
-    #
-    # Пример для разгона:
-    #
-    #   def op_add(self, args):
-    #       b = self.pop_int()          # вершина — второй операнд!
-    #       a = self.pop_int()
-    #       self.push(wrap32(a + b))
-
-    # ── ГЛАВА 6: корни ──────────────────────────────────────────────────
-    def roots(self):
-        """Все значения, с которых сборщик начинает обход:
-        стек операндов, локальные ВСЕХ кадров, глобальные."""
-        # TODO 6.1  Удобно сделать генератором:  yield from self.stack  и т. д.
-        raise NotImplementedError('Глава 6: VM.roots')
-
-
-def _short(v):
-    return f'obj[{len(v.items)}]' if isinstance(v, HeapObject) else str(v)
-
-
-# ════════════════════════════════════════════════════════════════════════
-#  Готовые инструменты: экран, график, командная строка
-# ════════════════════════════════════════════════════════════════════════
-
-PALETTE = [(0x00, 0x00, 0x00), (0x3b, 0x5b, 0xdb), (0xc2, 0x3b, 0x22), (0x8f, 0x3f, 0xa0),
-           (0x2f, 0x9e, 0x44), (0x23, 0xa6, 0xc9), (0xe8, 0xc5, 0x47), (0xf2, 0xf2, 0xee)]
-
-
-def save_png(screen, path, scale=10):
-    """Сохранить экран 32×32 в PNG без сторонних библиотек (zlib + struct)."""
-    import struct
-    import zlib
-    w = h = 32 * scale
-    raw = bytearray()
-    for y in range(h):
-        raw.append(0)
-        row = screen[y // scale]
-        for x in range(w):
-            raw.extend(PALETTE[row[x // scale]])
-
-    def chunk(tag, data):
-        c = struct.pack('>I', len(data)) + tag + data
-        return c + struct.pack('>I', zlib.crc32(tag + data) & 0xFFFFFFFF)
-    png = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
-           + chunk(b'IDAT', zlib.compress(bytes(raw), 9)) + chunk(b'IEND', b''))
-    with open(path, 'wb') as f:
-        f.write(png)
-
-
-def plot_heap(log, capacity, path):
-    """График занятости кучи (глава 6). По горизонтали — номер команды, по вертикали — used."""
-    # TODO 6.4  matplotlib: точки из log, линия ёмкости (axhline), моменты сборок.
-    print('(график кучи ещё не написан — глава 6)')
-
-
-BENCH_EXPECTED = 'БЕНЧМАРК: КОЛЛАЦ, N = 5000\nЛУЧШЕЕ n = 3711, ДЛИНА = 237\nСУММА ДЛИН = 387940\n'
-
-
-def calibrate(n=1_500_000):
-    """Эталонная нагрузка «как у интерпретатора»: стек, словарь, вызовы методов.
-    Нужна, чтобы сравнивать скорость машин на разных ноутбуках (глава 7). Не меняйте её."""
-    stack = []
-    push, pop = stack.append, stack.pop
-    table = {0: lambda a, b: a + b, 1: lambda a, b: a ^ b}
-    x = 1
-    t0 = time.perf_counter()
-    for i in range(n):
-        push(i)
-        push(x)
-        b = pop()
-        a = pop()
-        x = table[i & 1](a, b) & 0xFFFF
-    return n / (time.perf_counter() - t0)
-
-
-def read_cartridge(path):
-    with open(path, 'rb') as f:
+# Запуск программы, сохранение экрана и графика.
+COLORS = [
+    (0, 0, 0), (59, 91, 219), (194, 59, 34), (143, 63, 160),
+    (47, 158, 68), (35, 166, 201), (232, 197, 71), (242, 242, 238)
+]
+BENCH_EXPECTED = ('БЕНЧМАРК: КОЛЛАЦ, N = 5000\n'
+                  'ЛУЧШЕЕ n = 3711, ДЛИНА = 237\n'
+                  'СУММА ДЛИН = 387940\n')
+def cartridge(file):
+    with open(file, 'rb') as f:
         return load(f.read())
+def save_png(screen, file):
+    from PIL import Image
+    image = Image.new('RGB', (32, 32))
+    image.putdata([COLORS[screen[y][x]] for y in range(32) for x in range(32)])
+    image.resize((320, 320), Image.Resampling.NEAREST).save(file)
+    print('Экран сохранён:', file)
+def plot_heap(log, capacity, file):
+    import matplotlib.pyplot as plt
+    if not log:
+        return
+    plt.figure(figsize=(10, 4))
+    plt.plot([a for a, b, c in log], [b for a, b, c in log],
+             linewidth=0.8, label='Занято слотов')
+    plt.axhline(capacity, linestyle='--', color='gray', label='Ёмкость кучи')
+    for event, color in [('gc_before', 'red'), ('gc_after', 'green')]:
+        points = [(a, b) for a, b, c in log if c == event]
+        plt.scatter([a for a, b in points], [b for a, b in points],
+                    s=12, c=color)
+    plt.xlabel('Номер команды')
+    plt.ylabel('Занято слотов')
+    plt.title('Память виртуальной машины Квант-6')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(file)
+    plt.close()
+    print('График кучи сохранён:', file)
 
+def cmd_info(file):
+    c = cartridge(file)
+    print('Картридж:', c.owner)
+    print('Версия:', str(c.version[0]) + '.' + str(c.version[1]))
+    print('Тип картриджа:', c.kind)
+    print('Ёмкость кучи:', c.heap)
+    print('Глобальных переменных:', c.nglobals)
+    print('Точка входа:', c.entry)
+    print('Длина кода:', len(c.code))
+    print('SHA-256: совпадает')
+    for i in range(len(c.consts)): print(i, repr(c.consts[i]))
 
-def cmd_info(path):
-    with open(path, 'rb') as f:
-        data = f.read()
-    c = load(data)
-    kinds = {0: 'основной', 1: 'бенчмарк', 2: 'экзаменационный'}
-    print(f'Файл:           {path} ({len(data)} байт)')
-    print(f'Версия формата: {c.version[0]}.{c.version[1]}')
-    print(f'Владелец:       {c.owner}')
-    print(f'Тип:            {c.kind} ({kinds.get(c.kind, "?")})')
-    print(f'Ёмкость кучи:   {c.heap} слотов')
-    print(f'Глобальных:     {c.nglobals}')
-    print(f'Точка входа:    0x{c.entry:04X}')
-    print(f'Длина кода:     {len(c.code)} байт')
-    print(f'SHA-256:        совпадает')
-    print(f'Пул строк ({len(c.consts)}):')
-    for i, s in enumerate(c.consts):
-        print(f'  {i:>3}: {s!r}')
+def cmd_dis(file, output=None):
+    result = disassemble(cartridge(file))
+    if output:
+        with open(output, 'w', encoding='utf-8') as f:
+            f.write(result)
+        print('Листинг сохранён:', output)
+    else: print(result)
 
-
-def cmd_dis(path, out=None):
-    text = disassemble(read_cartridge(path))
-    if out:
-        os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-        with open(out, 'w', encoding='utf-8') as f:
-            f.write(text)
-        print(f'Листинг записан в {out}')
-    else:
-        print(text, end='')
-
-
-def cmd_run(path, no_limit=False, heap=None, out_dir='out', trace=False):
-    cart = read_cartridge(path)
-    vm = VM(cart, heap_capacity=heap, no_limit=no_limit, echo=True, trace=trace)
-    t0 = time.perf_counter()
+def cmd_run(file, no_limit=False, heap=None, out='out', trace=False):
+    c = cartridge(file)
+    vm = VM(c, no_limit=no_limit, heap_capacity=heap, trace=trace, echo=True)
+    start = time.perf_counter()
     try:
         vm.run()
-    except VMError as e:
-        print(f'\nОШИБКА VM: {e}')
-    dt = time.perf_counter() - t0
-    print()
-    print(vm.stats(), end='')
-    print(f'время:                {dt:.2f} с')
-    os.makedirs(out_dir, exist_ok=True)
-    png = os.path.join(out_dir, f'screen_{cart.owner}.png')
-    save_png(vm.screen, png)
-    print(f'Экран сохранён: {png}')
+    except VMError as error:
+        print('ОШИБКА VM:', error)
+    print('\n' + vm.stats())
+    print('время:', round(time.perf_counter() - start, 2), 'с')
+    os.makedirs(out, exist_ok=True)
+    save_png(vm.screen, os.path.join(out, 'screen_' + c.owner + '.png'))
     if vm.heap.log and not no_limit:
-        plot_heap(vm.heap.log, vm.heap.capacity, os.path.join(out_dir, f'heap_{cart.owner}.png'))
-    return vm
+        plot_heap(vm.heap.log, vm.heap.capacity,
+                  os.path.join(out, 'heap_' + c.owner + '.png'))
 
+def calibrate(n=1500000):
+    stack, x = [], 1
+    start = time.perf_counter()
+    for i in range(n):
+        stack.append(i)
+        stack.append(x)
+        b, a = stack.pop(), stack.pop()
+        x = (a + b if i % 2 == 0 else a ^ b) & 65535
+    return n / (time.perf_counter() - start)
 
-def cmd_bench(path, profile=False):
-    cart = read_cartridge(path)
-    vm = VM(cart)
-    print('Бенчмарк запущен, подождите…', flush=True)
-    t0 = time.perf_counter()
+def cmd_bench(file, profile=False):
+    vm = VM(cartridge(file))
     if profile:
         import cProfile
-        import pstats
-        prof = cProfile.Profile()
-        prof.enable()
-    try:
-        vm.run()
-    except VMError as e:
-        print(f'ОШИБКА VM: {e}')
+        profiler = cProfile.Profile()
+        profiler.enable()
+    start = time.perf_counter()
+    try: vm.run()
+    except VMError as error:
+        print('ОШИБКА VM:', error)
         return
-    dt = time.perf_counter() - t0
+    finally:
+        if profile: profiler.disable()
+    sec = time.perf_counter() - start
     if profile:
-        prof.disable()
-        pstats.Stats(prof).sort_stats('tottime').print_stats(12)
+        import pstats
+        pstats.Stats(profiler).sort_stats('tottime').print_stats(12)
     print(vm.output(), end='')
-    ok = vm.output() == BENCH_EXPECTED
-    speed = vm.steps / dt
-    calib = calibrate()
-    index = speed / calib * 1000
-    print(f'\nкоманд: {vm.steps:,}   время: {dt:.2f} с   скорость: {speed:,.0f} команд/с'.replace(',', ' '))
-    print(f'ответ верный: {"ДА" if ok else "НЕТ — результат не засчитывается"}')
-    print(f'КВАНТ-ИНДЕКС: {index:.0f}' if ok else 'КВАНТ-ИНДЕКС: —')
-    print(f'(Python {sys.version.split()[0]}; калибровка {calib:,.0f} оп/с)'.replace(',', ' '))
+    good = vm.output() == BENCH_EXPECTED
+    speed = vm.steps / sec
+    print('команд:', vm.steps, 'время:', round(sec, 2), 'с',
+          'скорость:', round(speed), 'команд/с')
+    print('ответ верный:', 'ДА' if good else 'НЕТ')
+    if good: print('КВАНТ-ИНДЕКС:', round(speed / calibrate() * 1000))
 
-
-def main(argv=None):
-    import argparse
-    p = argparse.ArgumentParser(prog='kvant.py', description='Эмулятор ЭВМ «Квант-6»')
-    sub = p.add_subparsers(dest='cmd', required=True)
-    s = sub.add_parser('info', help='заголовок и пул строк')
-    s.add_argument('file')
-    s = sub.add_parser('dis', help='дизассемблер')
-    s.add_argument('file')
-    s.add_argument('-o', '--out')
-    s = sub.add_parser('run', help='запустить картридж')
-    s.add_argument('file')
-    s.add_argument('--no-limit', action='store_true', help='без ограничения кучи и без сборки')
-    s.add_argument('--heap', type=int, help='заменить ёмкость кучи')
-    s.add_argument('--out', default='out', help='папка для PNG')
-    s.add_argument('--trace', action='store_true', help='печатать каждую команду (в stderr)')
-    s = sub.add_parser('bench', help='замер скорости (глава 7)')
-    s.add_argument('file')
-    s.add_argument('--profile', action='store_true', help='показать, где тратится время')
-    a = p.parse_args(argv)
+def start():
+    args = sys.argv[1:]
+    if not args:
+        args = ['run', os.path.join(os.path.dirname(__file__), '25КИ318.kv6')]
+        print('Запускаю твой картридж 25КИ318.kv6')
+    if len(args) < 2:
+        print('Пример: python kvant.py run "25КИ318.kv6"')
+        return
+    command, file = args[:2]
     try:
-        if a.cmd == 'info':
-            cmd_info(a.file)
-        elif a.cmd == 'dis':
-            cmd_dis(a.file, a.out)
-        elif a.cmd == 'run':
-            cmd_run(a.file, a.no_limit, a.heap, a.out, a.trace)
-        elif a.cmd == 'bench':
-            cmd_bench(a.file, a.profile)
-    except LoadError as e:
-        print(f'Картридж не загружен: {e}')
-        sys.exit(1)
-    except FileNotFoundError as e:
-        print(f'Нет такого файла: {e.filename}')
-        sys.exit(1)
-    except NotImplementedError as e:
-        print(f'\nЭта часть машины ещё не построена: {e}.\n'
-              f'Найдите в kvant.py соответствующий TODO.')
-        sys.exit(2)
-
-
+        if command == 'info': cmd_info(file)
+        elif command == 'dis':
+            output = args[args.index('-o') + 1] if '-o' in args else None
+            cmd_dis(file, output)
+        elif command == 'run':
+            folder = args[args.index('--out') + 1] if '--out' in args else 'out'
+            size = int(args[args.index('--heap') + 1]) if '--heap' in args else None
+            cmd_run(file, '--no-limit' in args, size, folder, '--trace' in args)
+        elif command == 'bench':
+            cmd_bench(file, '--profile' in args)
+        else: print('Неизвестная команда:', command)
+    except (LoadError, VMError, FileNotFoundError, ValueError) as error:
+        print('Ошибка:', error)
 if __name__ == '__main__':
-    main()
+    start()
